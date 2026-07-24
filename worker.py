@@ -33,14 +33,23 @@ class LineComment(BaseModel):
         description="A concrete, drop-in replacement code snippet or a step-by-step fix suggestion."
     )
 
+class ChecklistItem(BaseModel):
+    item_name: str = Field(..., description="The name of the checklist item.")
+    status: str = Field(..., description="PASSED, FAILED, or NOT_APPLICABLE.")
+    explanation: Optional[str] = Field(None, description="Detailed explanation of failure if status is FAILED.")
+
 class ReviewResult(BaseModel):
     summary: str = Field(
         ..., 
         description="High-level overview of the merge request review, highlighting key strengths and major areas of concern."
     )
-    checklist_status: str = Field(
-        ..., 
-        description="A summary of how the code fared against the custom review checklist (e.g., 'All security and performance checks passed', 'Failed security checklist due to hardcoded credential')."
+    merge_reviewer_checklist: List[ChecklistItem] = Field(
+        ...,
+        description="Detailed evaluation status for each item in the Merge Reviewer Checklist."
+    )
+    code_reviewer_checklist: List[ChecklistItem] = Field(
+        ...,
+        description="Detailed evaluation status for each item in the Code Reviewer Checklist."
     )
     comments: List[LineComment] = Field(
         ..., 
@@ -48,7 +57,7 @@ class ReviewResult(BaseModel):
     )
     should_approve: bool = Field(
         ..., 
-        description="True if there are NO 'CRITICAL' severity issues. False if one or more CRITICAL issues are identified."
+        description="True if there are NO 'CRITICAL' severity issues and all critical checklist items passed. False otherwise."
     )
 
 def process_merge_request(project_id: int, mr_iid: int, action: str, target_branch: str):
@@ -75,6 +84,24 @@ def process_merge_request(project_id: int, mr_iid: int, action: str, target_bran
         mr = project.mergerequests.get(mr_iid)
 
         logger.info(f"Retrieved MR: '{mr.title}' targeting branch '{mr.target_branch}'")
+
+        # 1.5 Extract MR Metadata
+        assignee_name = ", ".join([a.get("name", "") for a in getattr(mr, "assignees", []) if a]) or getattr(getattr(mr, "assignee", {}), "name", "None")
+        reviewer_names = ", ".join([r.get("name", "") for r in getattr(mr, "reviewers", []) if r])
+        labels_list = ", ".join(getattr(mr, "labels", []))
+        pipeline_status = "Unknown"
+        head_pipeline = getattr(mr, "head_pipeline", None)
+        if head_pipeline:
+            pipeline_status = head_pipeline.get("status", "Unknown")
+
+        mr_metadata = (
+            f"Source Branch Name: {mr.source_branch}\n"
+            f"Target Branch Name: {mr.target_branch}\n"
+            f"Assignee(s): {assignee_name}\n"
+            f"Reviewer(s): {reviewer_names}\n"
+            f"Labels: {labels_list}\n"
+            f"Pipeline Status: {pipeline_status}\n"
+        )
 
         # 2. Get MR Changes (Diffs)
         mr_changes = mr.changes()
@@ -110,8 +137,8 @@ def process_merge_request(project_id: int, mr_iid: int, action: str, target_bran
             logger.warning(f"Diff payload size ({len(diff_payload)} chars) exceeds limit. Truncating.")
             diff_payload = diff_payload[:max_chars] + "\n\n... [TRUNCATED DUE TO SIZE] ..."
 
-        # 4. Invoke Gemini AI Agent Loop
-        review_data = run_agent_review_loop(diff_payload, mr.title, mr.description or "")
+        # 4. Invoke LLM AI Agent Loop
+        review_data = run_agent_review_loop(diff_payload, mr.title, mr.description or "", mr_metadata)
         
         if not review_data:
             logger.error("AI review failed to produce a valid review result.")
@@ -212,7 +239,7 @@ def call_llm_provider(provider: str, model: str, api_key: str, system_instr: str
             
     raise RuntimeError(f"Failed to fetch content from {provider}")
 
-def run_agent_review_loop(diff_text: str, mr_title: str, mr_description: str) -> Optional[ReviewResult]:
+def run_agent_review_loop(diff_text: str, mr_title: str, mr_description: str, mr_metadata: str) -> Optional[ReviewResult]:
     """
     Two-stage agentic reasoning loop supporting multiple LLM providers:
     Stage 1: Multi-step code review draft generation.
@@ -224,19 +251,23 @@ def run_agent_review_loop(diff_text: str, mr_title: str, mr_description: str) ->
         model = settings.resolved_model_name
         
         system_instruction = (
-            "You are 'Antigravity Reviewer', an elite Principal Software Engineer & Security Auditor AI Agent. "
-            "Your task is to conduct a highly thorough code review of the provided code diff.\n\n"
+            "You are 'Prime AI Agent', an elite Principal Software Engineer & Security Auditor AI Agent. "
+            "Your task is to conduct a highly thorough code review of the provided code diff and MR metadata.\n\n"
             "Review Guidelines:\n"
             "1. Be precise, constructive, and technically accurate. Avoid generic feedback.\n"
             "2. Read the changes carefully and identify critical errors, performance bottlenecks, or security holes.\n"
-            "3. Enforce the user's checklist. Do not miss any items.\n"
-            "4. Only comment on line numbers that exist in the new version of the code and were added/modified in the diff (prefixed with '+'). "
-            "Verify this line number mapping carefully.\n"
-            "5. Always suggest concrete code fixes using Markdown blocks inside the suggestion field.\n"
+            "3. You must evaluate EVERY single item in both the 'Merge Reviewer Checklist' and 'Code Reviewer Checklist' based on the provided diff, files list, and MR metadata (like author, assignee, reviewers, labels, branch names).\n"
+            "4. Only comment on line numbers that exist in the new version of the code and were added/modified in the diff (prefixed with '+'). Verify this line number mapping carefully.\n"
+            "5. Suggest concrete code fixes using Markdown blocks inside the suggestion field.\n"
             "6. You MUST respond with a valid JSON object matching this schema:\n"
             "{\n"
             "  \"summary\": \"High-level review summary\",\n"
-            "  \"checklist_status\": \"Status of checklist checks\",\n"
+            "  \"merge_reviewer_checklist\": [\n"
+            "    {\"item_name\": \"item name\", \"status\": \"PASSED / FAILED / NOT_APPLICABLE\", \"explanation\": \"reason if FAILED\"}\n"
+            "  ],\n"
+            "  \"code_reviewer_checklist\": [\n"
+            "    {\"item_name\": \"item name\", \"status\": \"PASSED / FAILED / NOT_APPLICABLE\", \"explanation\": \"reason if FAILED\"}\n"
+            "  ],\n"
             "  \"comments\": [\n"
             "    {\n"
             "      \"file_path\": \"relative file path\",\n"
@@ -247,16 +278,39 @@ def run_agent_review_loop(diff_text: str, mr_title: str, mr_description: str) ->
             "    }\n"
             "  ],\n"
             "  \"should_approve\": true / false\n"
-            "}"
+            "}\n\n"
+            "Target Checklist Items to Evaluate:\n"
+            "--- MERGE REVIEWER CHECKLIST ---\n"
+            "- Respective Code Reviewer must approve the MR\n"
+            "- All comments/discussions are resolved\n"
+            "- Pipeline is green (build, lint(code quality), tests all passed)\n"
+            "- Testcases have actually run and passed\n"
+            "- No unrelated or extra files included in this MR\n"
+            "- Branch name follows the naming convention\n"
+            "- Branch tracking sheet is updated with the branch being merged\n"
+            "- MR title is clear and describes the change\n"
+            "- Description is written (what changed + why)\n"
+            "- Labels are added (e.g. feature, fix, docs, test, refactor, chore)\n"
+            "- Reviewer is set - Roshan\n"
+            "- Assignee is set - Developer who wrote the code\n\n"
+            "--- CODE REVIEWER CHECKLIST ---\n"
+            "- Code does what was discussed/agreed for this task, nothing extra, nothing missing\n"
+            "- Coding standards followed (naming, formatting, structure, no dead/commented-out code)\n"
+            "- Code follows the design doc / related doc, no deviation without discussion\n"
+            "- No duplicate logic, reused existing functions/services where possible\n"
+            "- Error handling is present, not just the happy path\n"
+            "- This MR sticks to one thing, not a mix of unrelated changes stuffed together\n"
+            "- New/changed logic has testcases covering it\n"
+            "- Developer followed the AI/vibe-coding standards, and the prompts used are logged in the tracking excel"
         )
 
         # STAGE 1: Gather and analyze
         prompt = (
             f"Merge Request Title: {mr_title}\n"
             f"Merge Request Description: {mr_description}\n\n"
-            f"Target Review Checklist:\n{settings.review_checklist}\n\n"
+            f"Merge Request Metadata:\n{mr_metadata}\n\n"
             f"Code Diff:\n{diff_text}\n\n"
-            "Perform a detailed code review. Think step-by-step to identify issues. "
+            "Perform a detailed code review and evaluate both target checklists. Think step-by-step to identify issues. "
             "Draft your findings. Focus on security, correctness, and adherence to the checklist."
         )
 
@@ -272,11 +326,13 @@ def run_agent_review_loop(diff_text: str, mr_title: str, mr_description: str) ->
         critique_prompt = (
             f"Review Draft:\n{stage1_clean}\n\n"
             f"Code Diff Reference:\n{diff_text}\n\n"
+            f"Merge Request Metadata Reference:\n{mr_metadata}\n\n"
             "Act as a critical auditor. Review the draft suggestions and verify:\n"
             "1. Do the line numbers specified actually match lines added or modified in the diff (lines starting with '+' under the file)? "
             "If a line number points to code that is unmodified or deleted, correct the line number to the closest appropriate added line, or remove the comment entirely.\n"
             "2. Are there any false positives, hallucinated APIs, or nitpicks that violate coding standards? If so, remove them.\n"
-            "3. Is the severity rating correct? (Only mark as 'CRITICAL' if it is a major bug, security vulnerability, or checklist failure).\n\n"
+            "3. Is the severity rating correct? (Only mark as 'CRITICAL' if it is a major bug, security vulnerability, or checklist failure).\n"
+            "4. Verify that the checklist statuses (PASSED/FAILED/NOT_APPLICABLE) are highly accurate based on the diff and metadata.\n\n"
             "Output the final refined code review in the required JSON schema format."
         )
 
@@ -325,7 +381,7 @@ def post_review_comments(mr, review_data: ReviewResult):
                 continue
                 
             body = (
-                f"### 🤖 Antigravity AI Agent Review: {comment.severity}\n"
+                f"### 🤖 Prime AI Agent Review: {comment.severity}\n"
                 f"**Issue:** {comment.issue_description}\n\n"
                 f"**Suggested Fix:**\n{comment.suggestion}"
             )
@@ -354,9 +410,28 @@ def post_review_comments(mr, review_data: ReviewResult):
                 failed_inline_comments.append(comment)
 
     # 2. Construct Overall Summary Comment
-    summary_body = f"## 🤖 Antigravity AI Agent Review Summary\n\n"
-    summary_body += f"**Checklist Status:** {review_data.checklist_status}\n\n"
+    summary_body = f"## 🤖 Prime AI Agent Review Summary\n\n"
     summary_body += f"{review_data.summary}\n\n"
+    
+    # Format Merge Reviewer Checklist
+    summary_body += "### 📋 Merge Reviewer Checklist\n"
+    summary_body += "| Item | Status | Reason / Explanation |\n"
+    summary_body += "| :--- | :---: | :--- |\n"
+    for item in review_data.merge_reviewer_checklist:
+        status_emoji = "🟢 Pass" if item.status.upper() == "PASSED" else "🔴 Fail" if item.status.upper() == "FAILED" else "⚪ N/A"
+        explanation = item.explanation if item.explanation else ""
+        summary_body += f"| {item.item_name} | {status_emoji} | {explanation} |\n"
+    summary_body += "\n"
+    
+    # Format Code Reviewer Checklist
+    summary_body += "### 📋 Code Reviewer Checklist\n"
+    summary_body += "| Item | Status | Reason / Explanation |\n"
+    summary_body += "| :--- | :---: | :--- |\n"
+    for item in review_data.code_reviewer_checklist:
+        status_emoji = "🟢 Pass" if item.status.upper() == "PASSED" else "🔴 Fail" if item.status.upper() == "FAILED" else "⚪ N/A"
+        explanation = item.explanation if item.explanation else ""
+        summary_body += f"| {item.item_name} | {status_emoji} | {explanation} |\n"
+    summary_body += "\n"
     
     # Add block decision info
     if review_data.should_approve:
