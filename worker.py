@@ -16,9 +16,9 @@ class LineComment(BaseModel):
         ..., 
         description="The relative path of the file to comment on, e.g., 'src/main.py'."
     )
-    line_number: int = Field(
-        ..., 
-        description="The line number in the NEW version of the file where the issue resides. Must be a line added or modified in the diff (prefixed with '+')."
+    line_number: Optional[int] = Field(
+        None, 
+        description="The line number in the NEW version of the file where the issue resides. Must be a line added or modified in the diff (prefixed with '+'). Leave null/empty only if the comment applies to the file as a whole rather than a specific line."
     )
     severity: str = Field(
         ..., 
@@ -319,6 +319,11 @@ def post_review_comments(mr, review_data: ReviewResult):
         failed_inline_comments.extend(review_data.comments)
     else:
         for comment in review_data.comments:
+            if comment.line_number is None:
+                logger.info(f"Comment on {comment.file_path} has no line number. Adding to fallback list.")
+                failed_inline_comments.append(comment)
+                continue
+                
             body = (
                 f"### 🤖 Antigravity AI Agent Review: {comment.severity}\n"
                 f"**Issue:** {comment.issue_description}\n\n"
